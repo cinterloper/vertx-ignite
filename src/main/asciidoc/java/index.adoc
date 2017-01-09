@@ -20,7 +20,7 @@ adapted to your environment. So you can replace default Vert.x cluster manager b
 == Using Ignite cluster manager
 
 If the jar is on your classpath then Vert.x will automatically detect this and use it as the cluster manager.
-Please make sure you don’t have any other cluster managers on your classpath or Vert.x might choose the wrong one.
+Please make sure you don?t have any other cluster managers on your classpath or Vert.x might choose the wrong one.
 
 Alternatively, you can configure the following system property to instruct vert.x to use this cluster manager:
 `-Dvertx.clusterManagerFactory=io.vertx.spi.cluster.ignite.IgniteClusterManager`

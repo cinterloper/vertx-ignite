@@ -66,327 +66,369 @@ import static org.apache.ignite.events.EventType.EVT_NODE_LEFT;
  */
 public class IgniteClusterManager implements ClusterManager {
 
-  private static final Logger log = LoggerFactory.getLogger(IgniteClusterManager.class);
+    private static final Logger log = LoggerFactory.getLogger(IgniteClusterManager.class);
 
-  // Default Ignite configuration file
-  private static final String DEFAULT_CONFIG_FILE = "default-ignite.xml";
+    // Default Ignite configuration file
+    private static final String DEFAULT_CONFIG_FILE = "default-ignite.xml";
 
-  // User defined Ignite configuration file
-  private static final String CONFIG_FILE = "ignite.xml";
+    // User defined Ignite configuration file
+    private static final String CONFIG_FILE = "ignite.xml";
 
-  public static final String VERTX_CACHE_TEMPLATE_NAME = "*";
+    public static final String VERTX_CACHE_TEMPLATE_NAME = "*";
 
-  private static final String VERTX_NODE_PREFIX = "vertx.ignite.node.";
+    private static final String VERTX_NODE_PREFIX = "vertx.ignite.node.";
 
-  private Vertx vertx;
+    private Vertx vertx;
 
-  private IgniteConfiguration cfg;
-  private Ignite ignite;
+    private IgniteConfiguration cfg;
+    private Ignite ignite;
 
-  private String nodeID = UUID.randomUUID().toString();
-  private NodeListener nodeListener;
+    private String nodeID = UUID.randomUUID().toString();
+    private NodeListener nodeListener;
 
-  private volatile boolean active;
+    private volatile boolean active;
 
-  private final Object monitor = new Object();
+    private final Object monitor = new Object();
 
-  private CollectionConfiguration collectionCfg;
+    private CollectionConfiguration collectionCfg;
+    private String CACHE_CONFIG_PROVIDER;
+    private ClassLoader ctxClsLoader = Thread.currentThread().getContextClassLoader();
+    private cacheConfigProvider cachecfgprovider;
 
-  /**
-   * Default constructor. Cluster manager will get configuration from classpath.
-   */
-  @SuppressWarnings("unused")
-  public IgniteClusterManager() {
-    System.setProperty("IGNITE_NO_SHUTDOWN_HOOK", "true");
-  }
+    /**
+     * Default constructor. Cluster manager will get configuration from classpath.
+     */
+    @SuppressWarnings("unused")
+    public IgniteClusterManager() {
+        System.setProperty("IGNITE_NO_SHUTDOWN_HOOK", "true");
+    }
 
-  /**
-   * Creates cluster manager instance with given Ignite configuration.
-   * Use this constructor in order to configure cluster manager programmatically.
-   *
-   * @param cfg {@code IgniteConfiguration} instance.
-   */
-  @SuppressWarnings("unused")
-  public IgniteClusterManager(IgniteConfiguration cfg) {
-    this.cfg = cfg;
-    setNodeID(cfg);
-  }
+    /**
+     * Creates cluster manager instance with given Ignite configuration.
+     * Use this constructor in order to configure cluster manager programmatically.
+     *
+     * @param cfg {@code IgniteConfiguration} instance.
+     */
+    @SuppressWarnings("unused")
+    public IgniteClusterManager(IgniteConfiguration cfg) {
+        this.cfg = cfg;
+        setNodeID(cfg);
+    }
 
-  /**
-   * Creates cluster manager instance with given Spring XML configuration file.
-   * Use this constructor in order to configure cluster manager programmatically.
-   *
-   * @param configFile {@code URL} path to Spring XML configuration file.
-   */
-  @SuppressWarnings("unused")
-  public IgniteClusterManager(URL configFile) {
-    this.cfg = loadConfiguration(configFile);
-  }
-  
-  @Override
-  public void setVertx(Vertx vertx) {
-    this.vertx = vertx;
-  }
+    /**
+     * Creates cluster manager instance with given Spring XML configuration file.
+     * Use this constructor in order to configure cluster manager programmatically.
+     *
+     * @param configFile {@code URL} path to Spring XML configuration file.
+     */
+    @SuppressWarnings("unused")
+    public IgniteClusterManager(URL configFile) {
+        this.cfg = loadConfiguration(configFile);
+    }
 
-  @Override
-  public void nodeListener(NodeListener nodeListener) {
-    this.nodeListener = nodeListener;
-  }
+    @Override
+    public void setVertx(Vertx vertx) {
+        this.vertx = vertx;
+        try {
+            CACHE_CONFIG_PROVIDER = vertx.getOrCreateContext().config().getString("IgniteCacheConfigProvider");
+            cachecfgprovider = loadCacheConfigurationProvider();
+        } catch (Exception unconfigured) {
+            CACHE_CONFIG_PROVIDER = defaultCacheConfigProvider.class.getName();
+        }
+    }
 
-  @Override
-  public <K, V> void getAsyncMultiMap(String name, Handler<AsyncResult<AsyncMultiMap<K, V>>> handler) {
-    vertx.executeBlocking(
-      fut -> fut.complete(new AsyncMultiMapImpl<>(this.<K, List<V>>getCache(name), vertx)), handler
-    );
-  }
+    @Override
+    public void nodeListener(NodeListener nodeListener) {
+        this.nodeListener = nodeListener;
+    }
 
-  @Override
-  public <K, V> void getAsyncMap(String name, Handler<AsyncResult<AsyncMap<K, V>>> handler) {
-    vertx.executeBlocking(
-      fut -> fut.complete(new AsyncMapImpl<>(getCache(name), vertx)), handler
-    );
-  }
+    @Override
+    public <K, V> void getAsyncMultiMap(String name, Handler<AsyncResult<AsyncMultiMap<K, V>>> handler) {
+        vertx.executeBlocking(
+                fut -> fut.complete(new AsyncMultiMapImpl<>(this.<K, List<V>>getCache(name), vertx)), handler
+        );
+    }
 
-  @Override
-  public <K, V> Map<K, V> getSyncMap(String name) {
-    return new MapImpl<>(getCache(name));
-  }
+    @Override
+    public <K, V> void getAsyncMap(String name, Handler<AsyncResult<AsyncMap<K, V>>> handler) {
+        vertx.executeBlocking(
+                fut -> fut.complete(new AsyncMapImpl<>(getCache(name), vertx)), handler
+        );
+    }
 
-  @Override
-  public void getLockWithTimeout(String name, long timeout, Handler<AsyncResult<Lock>> handler) {
-    vertx.executeBlocking(fut -> {
-      IgniteQueue<Boolean> queue = getQueue(name);
+    @Override
+    public <K, V> Map<K, V> getSyncMap(String name) {
+        return new MapImpl<>(getCache(name));
+    }
 
-      boolean locked = false;
-      try {
-        locked = queue.offer(true, timeout, TimeUnit.MILLISECONDS);
-      } catch (Exception e) {
-        fut.fail(new VertxException("Error during getting lock " + name, e));
-      }
+    @Override
+    public void getLockWithTimeout(String name, long timeout, Handler<AsyncResult<Lock>> handler) {
+        vertx.executeBlocking(fut -> {
+            IgniteQueue<Boolean> queue = getQueue(name);
 
-      if (locked) {
-        fut.complete(new LockImpl(name));
-      } else {
-        fut.fail(new VertxException("Timed out waiting to get lock " + name));
-      }
-    }, handler);
-  }
-
-  @Override
-  public void getCounter(String name, Handler<AsyncResult<Counter>> handler) {
-    vertx.executeBlocking(fut -> fut.complete(new CounterImpl(ignite.atomicLong(name, 0, true))), handler);
-  }
-
-  @Override
-  public String getNodeID() {
-    return nodeID;
-  }
-
-  @Override
-  public List<String> getNodes() {
-    return ignite.cluster().nodes().stream()
-      .map(IgniteClusterManager::nodeId).collect(Collectors.toList());
-  }
-
-  @Override
-  public void join(Handler<AsyncResult<Void>> handler) {
-    synchronized (monitor) {
-      vertx.executeBlocking(fut -> {
-        if (!active) {
-          active = true;
-
-          ignite = cfg == null ? Ignition.start(loadConfiguration()) : Ignition.start(cfg);
-          nodeID = nodeId(ignite.cluster().localNode());
-
-          for (CacheConfiguration cacheCfg : ignite.configuration().getCacheConfiguration()) {
-            if (cacheCfg.getName().equals(VERTX_CACHE_TEMPLATE_NAME)) {
-              collectionCfg = new CollectionConfiguration();
-              collectionCfg.setAtomicityMode(cacheCfg.getAtomicityMode());
-              collectionCfg.setBackups(cacheCfg.getBackups());
-              break;
-            }
-          }
-
-          if (collectionCfg == null) {
-            collectionCfg = new CollectionConfiguration();
-          }
-
-          ignite.events().localListen(event -> {
-            if (!active) {
-              return false;
+            boolean locked = false;
+            try {
+                locked = queue.offer(true, timeout, TimeUnit.MILLISECONDS);
+            } catch (Exception e) {
+                fut.fail(new VertxException("Error during getting lock " + name, e));
             }
 
-            if (nodeListener != null) {
-              vertx.executeBlocking(f -> {
-                if (isActive()) {
-                  switch (event.type()) {
-                    case EVT_NODE_JOINED:
-                      nodeListener.nodeAdded(nodeId(((DiscoveryEvent) event).eventNode()));
-                      break;
-                    case EVT_NODE_LEFT:
-                    case EVT_NODE_FAILED:
-                      nodeListener.nodeLeft(nodeId(((DiscoveryEvent) event).eventNode()));
-                      break;
-                  }
+            if (locked) {
+                fut.complete(new LockImpl(name));
+            } else {
+                fut.fail(new VertxException("Timed out waiting to get lock " + name));
+            }
+        }, handler);
+    }
+
+    @Override
+    public void getCounter(String name, Handler<AsyncResult<Counter>> handler) {
+        vertx.executeBlocking(fut -> fut.complete(new CounterImpl(ignite.atomicLong(name, 0, true))), handler);
+    }
+
+    @Override
+    public String getNodeID() {
+        return nodeID;
+    }
+
+    @Override
+    public List<String> getNodes() {
+        return ignite.cluster().nodes().stream()
+                .map(IgniteClusterManager::nodeId).collect(Collectors.toList());
+    }
+
+    @Override
+    public void join(Handler<AsyncResult<Void>> handler) {
+        synchronized (monitor) {
+            vertx.executeBlocking(fut -> {
+                if (!active) {
+                    active = true;
+
+                    ignite = cfg == null ? Ignition.start(loadConfiguration()) : Ignition.start(cfg);
+                    nodeID = nodeId(ignite.cluster().localNode());
+
+                    for (CacheConfiguration cacheCfg : ignite.configuration().getCacheConfiguration()) {
+                        if (cacheCfg.getName().equals(VERTX_CACHE_TEMPLATE_NAME)) {
+                            collectionCfg = new CollectionConfiguration();
+                            collectionCfg.setAtomicityMode(cacheCfg.getAtomicityMode());
+                            collectionCfg.setBackups(cacheCfg.getBackups());
+                            break;
+                        }
+                    }
+
+                    if (collectionCfg == null) {
+                        collectionCfg = new CollectionConfiguration();
+                    }
+
+                    ignite.events().localListen(event -> {
+                        if (!active) {
+                            return false;
+                        }
+
+                        if (nodeListener != null) {
+                            vertx.executeBlocking(f -> {
+                                if (isActive()) {
+                                    switch (event.type()) {
+                                        case EVT_NODE_JOINED:
+                                            nodeListener.nodeAdded(nodeId(((DiscoveryEvent) event).eventNode()));
+                                            break;
+                                        case EVT_NODE_LEFT:
+                                        case EVT_NODE_FAILED:
+                                            nodeListener.nodeLeft(nodeId(((DiscoveryEvent) event).eventNode()));
+                                            break;
+                                    }
+                                }
+                                fut.complete();
+                            }, null);
+                        }
+
+                        return true;
+                    }, EVT_NODE_JOINED, EVT_NODE_LEFT, EVT_NODE_FAILED);
+
+                    fut.complete();
                 }
+            }, handler);
+        }
+    }
+
+    @Override
+    public void leave(Handler<AsyncResult<Void>> handler) {
+        synchronized (monitor) {
+            vertx.executeBlocking(fut -> {
+                if (active) {
+                    active = false;
+                    try {
+                        ignite.close();
+                    } catch (Exception e) {
+                        log.error(e);
+                    }
+                }
+
                 fut.complete();
-              }, null);
+            }, handler);
+        }
+    }
+
+    @Override
+    public boolean isActive() {
+        return active;
+    }
+
+    private IgniteConfiguration loadConfiguration(URL config) {
+        try {
+            IgniteConfiguration cfg = F.first(IgnitionEx.loadConfigurations(config).get1());
+            setNodeID(cfg);
+            return cfg;
+        } catch (IgniteCheckedException e) {
+            log.error("Configuration loading error:", e);
+            throw new RuntimeException(e);
+        }
+    }
+
+    private IgniteConfiguration loadConfiguration() {
+        ClassLoader ctxClsLoader = Thread.currentThread().getContextClassLoader();
+
+        InputStream is = null;
+
+        if (ctxClsLoader != null) {
+            is = ctxClsLoader.getResourceAsStream(CONFIG_FILE);
+        }
+
+        if (is == null) {
+            is = getClass().getClassLoader().getResourceAsStream(CONFIG_FILE);
+
+            if (is == null) {
+                is = getClass().getClassLoader().getResourceAsStream(DEFAULT_CONFIG_FILE);
+                log.info("Using default configuration.");
+            }
+        }
+
+        try {
+            IgniteConfiguration cfg = F.first(IgnitionEx.loadConfigurations(is).get1());
+            setNodeID(cfg);
+            return cfg;
+        } catch (IgniteCheckedException e) {
+            log.error("Configuration loading error:", e);
+            throw new RuntimeException(e);
+        }
+    }
+
+    private cacheConfigProvider loadCacheConfigurationProvider() {
+        Class ccp = null;
+
+        try {
+            if (ctxClsLoader != null && CACHE_CONFIG_PROVIDER != null) {
+                ccp = ctxClsLoader.loadClass(CACHE_CONFIG_PROVIDER);
             }
 
-            return true;
-          }, EVT_NODE_JOINED, EVT_NODE_LEFT, EVT_NODE_FAILED);
+            if (ccp == null && CACHE_CONFIG_PROVIDER != null) {
+                ccp = getClass().getClassLoader().loadClass(CACHE_CONFIG_PROVIDER);
+            }
+            if (ccp != null) {
+                return (cacheConfigProvider)ccp.newInstance();
+            }
+            return new defaultCacheConfigProvider();
 
-          fut.complete();
+
+        } catch (Exception e) {
+            log.error("cache configuration provider loading error:", e);
+            throw new RuntimeException(e);
         }
-      }, handler);
     }
-  }
 
-  @Override
-  public void leave(Handler<AsyncResult<Void>> handler) {
-    synchronized (monitor) {
-      vertx.executeBlocking(fut -> {
-        if (active) {
-          active = false;
-          try {
-            ignite.close();
-          } catch (Exception e) {
-            log.error(e);
-          }
+
+    private void setNodeID(IgniteConfiguration cfg) {
+        UUID uuid = UUID.fromString(nodeID);
+        cfg.setNodeId(uuid);
+        cfg.setGridName(VERTX_NODE_PREFIX + uuid);
+    }
+
+    @SuppressWarnings("unchecked")
+    private <K, V> IgniteCache<K, V> getCache(String name) {
+        CacheConfiguration cfg = cachecfgprovider.getCacheConfig(name,ignite,vertx);
+        return ignite.getOrCreateCache(cfg);
+    }
+
+    private <T> IgniteQueue<T> getQueue(String name) {
+        return ignite.queue(name, 1, collectionCfg);
+    }
+
+    private static String nodeId(ClusterNode node) {
+        return node.id().toString();
+    }
+
+    private class LockImpl implements Lock {
+        private final String name;
+
+        private LockImpl(String name) {
+            this.name = name;
         }
 
-        fut.complete();
-      }, handler);
-    }
-  }
+        @Override
+        public void release() {
+            IgniteQueue<Boolean> queue = getQueue(name);
+            Boolean locked = queue.poll();
 
-  @Override
-  public boolean isActive() {
-    return active;
-  }
-
-  private IgniteConfiguration loadConfiguration(URL config) {
-    try {
-      IgniteConfiguration cfg = F.first(IgnitionEx.loadConfigurations(config).get1());
-      setNodeID(cfg);
-      return cfg;
-    } catch (IgniteCheckedException e) {
-      log.error("Configuration loading error:", e);
-      throw new RuntimeException(e);
-    }
-  }
-  
-  private IgniteConfiguration loadConfiguration() {
-    ClassLoader ctxClsLoader = Thread.currentThread().getContextClassLoader();
-
-    InputStream is = null;
-
-    if (ctxClsLoader != null) {
-      is = ctxClsLoader.getResourceAsStream(CONFIG_FILE);
+            if (!locked) {
+                throw new VertxException("Inconsistent lock state " + name);
+            }
+        }
     }
 
-    if (is == null) {
-      is = getClass().getClassLoader().getResourceAsStream(CONFIG_FILE);
+    private class CounterImpl implements Counter {
+        private final IgniteAtomicLong cnt;
 
-      if (is == null) {
-        is = getClass().getClassLoader().getResourceAsStream(DEFAULT_CONFIG_FILE);
-        log.info("Using default configuration.");
-      }
+        private CounterImpl(IgniteAtomicLong cnt) {
+            this.cnt = cnt;
+        }
+
+        @Override
+        public void get(Handler<AsyncResult<Long>> handler) {
+            Objects.requireNonNull(handler, "handler");
+            vertx.executeBlocking(fut -> fut.complete(cnt.get()), handler);
+        }
+
+        @Override
+        public void incrementAndGet(Handler<AsyncResult<Long>> handler) {
+            Objects.requireNonNull(handler, "handler");
+            vertx.executeBlocking(fut -> fut.complete(cnt.incrementAndGet()), handler);
+        }
+
+        @Override
+        public void getAndIncrement(Handler<AsyncResult<Long>> handler) {
+            Objects.requireNonNull(handler, "handler");
+            vertx.executeBlocking(fut -> fut.complete(cnt.getAndIncrement()), handler);
+        }
+
+        @Override
+        public void decrementAndGet(Handler<AsyncResult<Long>> handler) {
+            Objects.requireNonNull(handler, "handler");
+            vertx.executeBlocking(fut -> fut.complete(cnt.decrementAndGet()), handler);
+        }
+
+        @Override
+        public void addAndGet(long value, Handler<AsyncResult<Long>> handler) {
+            Objects.requireNonNull(handler, "handler");
+            vertx.executeBlocking(fut -> fut.complete(cnt.addAndGet(value)), handler);
+        }
+
+        @Override
+        public void getAndAdd(long value, Handler<AsyncResult<Long>> handler) {
+            Objects.requireNonNull(handler, "handler");
+            vertx.executeBlocking(fut -> fut.complete(cnt.getAndAdd(value)), handler);
+        }
+
+        @Override
+        public void compareAndSet(long expected, long value, Handler<AsyncResult<Boolean>> handler) {
+            Objects.requireNonNull(handler, "handler");
+            vertx.executeBlocking(fut -> fut.complete(cnt.compareAndSet(expected, value)), handler);
+        }
     }
 
-    try {
-      IgniteConfiguration cfg = F.first(IgnitionEx.loadConfigurations(is).get1());
-      setNodeID(cfg);
-      return cfg;
-    } catch (IgniteCheckedException e) {
-      log.error("Configuration loading error:", e);
-      throw new RuntimeException(e);
+    class defaultCacheConfigProvider implements cacheConfigProvider {
+        @Override
+        public CacheConfiguration getCacheConfig(String name, Ignite ignite, Vertx vertx) {
+            return new CacheConfiguration().setName(name);
+        }
     }
-  }
-
-  private void setNodeID(IgniteConfiguration cfg) {
-    UUID uuid = UUID.fromString(nodeID);
-    cfg.setNodeId(uuid);
-    cfg.setGridName(VERTX_NODE_PREFIX + uuid);
-  }
-
-  private <K, V> IgniteCache<K, V> getCache(String name) {
-    return ignite.getOrCreateCache(name);
-  }
-
-  private <T> IgniteQueue<T> getQueue(String name) {
-    return ignite.queue(name, 1, collectionCfg);
-  }
-
-  private static String nodeId(ClusterNode node) {
-    return node.id().toString();
-  }
-
-  private class LockImpl implements Lock {
-    private final String name;
-
-    private LockImpl(String name) {
-      this.name = name;
-    }
-
-    @Override
-    public void release() {
-      IgniteQueue<Boolean> queue = getQueue(name);
-      Boolean locked = queue.poll();
-
-      if (!locked) {
-        throw new VertxException("Inconsistent lock state " + name);
-      }
-    }
-  }
-
-  private class CounterImpl implements Counter {
-    private final IgniteAtomicLong cnt;
-
-    private CounterImpl(IgniteAtomicLong cnt) {
-      this.cnt = cnt;
-    }
-
-    @Override
-    public void get(Handler<AsyncResult<Long>> handler) {
-      Objects.requireNonNull(handler, "handler");
-      vertx.executeBlocking(fut -> fut.complete(cnt.get()), handler);
-    }
-
-    @Override
-    public void incrementAndGet(Handler<AsyncResult<Long>> handler) {
-      Objects.requireNonNull(handler, "handler");
-      vertx.executeBlocking(fut -> fut.complete(cnt.incrementAndGet()), handler);
-    }
-
-    @Override
-    public void getAndIncrement(Handler<AsyncResult<Long>> handler) {
-      Objects.requireNonNull(handler, "handler");
-      vertx.executeBlocking(fut -> fut.complete(cnt.getAndIncrement()), handler);
-    }
-
-    @Override
-    public void decrementAndGet(Handler<AsyncResult<Long>> handler) {
-      Objects.requireNonNull(handler, "handler");
-      vertx.executeBlocking(fut -> fut.complete(cnt.decrementAndGet()), handler);
-    }
-
-    @Override
-    public void addAndGet(long value, Handler<AsyncResult<Long>> handler) {
-      Objects.requireNonNull(handler, "handler");
-      vertx.executeBlocking(fut -> fut.complete(cnt.addAndGet(value)), handler);
-    }
-
-    @Override
-    public void getAndAdd(long value, Handler<AsyncResult<Long>> handler) {
-      Objects.requireNonNull(handler, "handler");
-      vertx.executeBlocking(fut -> fut.complete(cnt.getAndAdd(value)), handler);
-    }
-
-    @Override
-    public void compareAndSet(long expected, long value, Handler<AsyncResult<Boolean>> handler) {
-      Objects.requireNonNull(handler, "handler");
-      vertx.executeBlocking(fut -> fut.complete(cnt.compareAndSet(expected, value)), handler);
-    }
-  }
 }
